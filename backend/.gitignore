@@ -1,0 +1,18 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# Project specific
+backend/uploads/
+backend/chroma_db/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
