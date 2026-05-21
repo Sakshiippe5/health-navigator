@@ -225,3 +225,114 @@ def get_collection_info(file_id: str) -> Dict[str, Any]:
         "is_embedded": count > 0,
         "embedding_model": EMBEDDING_MODEL,
     }
+
+def search_across_documents(
+    file_ids: List[str],
+    query: str,
+    n_results_per_doc: int = 2,
+    total_results: int = 5
+) -> Dict[str, Any]:
+    """
+    Searches multiple documents simultaneously and returns
+    the most relevant chunks across ALL of them.
+
+    WHY n_results_per_doc = 2?
+    If we take 3 chunks per doc and have 5 docs = 15 chunks.
+    That's too much context for the LLM. So we take fewer
+    per doc but search more docs. Then sort and keep the best.
+
+    Args:
+        file_ids: List of document IDs to search across
+        query: User's question
+        n_results_per_doc: Chunks to retrieve per document
+        total_results: Final number of chunks to send to LLM
+
+    Returns:
+        Combined and ranked results from all documents
+    """
+
+    all_results = []
+    searched_docs = []
+    failed_docs = []
+
+    # Search each document separately
+    for file_id in file_ids:
+        try:
+            result = search_similar_chunks(
+                file_id=file_id,
+                query=query,
+                n_results=n_results_per_doc
+            )
+
+            if result["status"] == "success":
+                # Tag each chunk with which document it came from
+                for chunk in result["results"]:
+                    chunk["source_file_id"] = file_id  # ← crucial for attribution
+                    all_results.append(chunk)
+                searched_docs.append(file_id)
+
+            elif result["status"] == "not_embedded":
+                failed_docs.append({
+                    "file_id": file_id,
+                    "reason": "not_embedded"
+                })
+
+        except Exception as e:
+            failed_docs.append({
+                "file_id": file_id,
+                "reason": str(e)
+            })
+
+    # No results found at all
+    if not all_results:
+        return {
+            "status": "no_results",
+            "message": "No embedded documents found. Embed your PDFs first.",
+            "results": [],
+            "searched_docs": searched_docs,
+            "failed_docs": failed_docs
+        }
+
+    # Sort ALL chunks by similarity score (highest first)
+    # This is the key step — we rank across ALL documents together
+    all_results.sort(key=lambda x: x["similarity_score"], reverse=True)
+
+    # Keep only the top N most relevant chunks
+    top_results = all_results[:total_results]
+
+    return {
+        "status": "success",
+        "query": query,
+        "total_results": len(top_results),
+        "searched_docs": searched_docs,
+        "failed_docs": failed_docs,
+        "results": top_results
+    }
+
+
+def list_embedded_documents() -> Dict[str, Any]:
+    """
+    Returns all documents currently embedded in ChromaDB.
+    Useful for frontend to know which docs are searchable.
+    """
+    # ChromaDB client is already initialized at top of file
+    # list_collections() returns all collections
+    collections = client.list_collections()
+
+    documents = []
+    for collection in collections:
+        # Our naming convention: "doc_{file_id}"
+        # So we strip "doc_" to get the file_id back
+        if collection.name.startswith("doc_"):
+            file_id = collection.name.replace("doc_", "")
+            col = client.get_collection(collection.name)
+            documents.append({
+                "file_id": file_id,
+                "collection_name": collection.name,
+                "total_chunks": col.count(),
+            })
+
+    return {
+        "total_documents": len(documents),
+        "documents": documents
+    }

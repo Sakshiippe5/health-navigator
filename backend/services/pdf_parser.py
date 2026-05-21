@@ -12,7 +12,7 @@ import fitz  # PyMuPDF — 'fitz' is its legacy import name, don't let it confus
 import os
 from typing import List, Dict, Any
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
+from services.smart_chunker import hybrid_chunk, get_chunking_stats
 # ── Constants ────────────────────────────────────────────────────────────────
 # These numbers are tuned for medical documents — we'll explain each below
 CHUNK_SIZE = 500        # Max characters per chunk
@@ -150,6 +150,29 @@ def parse_and_chunk_pdf(file_path: str) -> Dict[str, Any]:
         "total_pages": extraction_result["total_pages"],
         "total_characters": extraction_result["total_characters"],
         "total_chunks": len(chunks),
+        "pages": extraction_result["pages"],
+        "chunks": chunks
+    }
+
+def parse_and_chunk_pdf_smart(file_path: str) -> Dict[str, Any]:
+    """
+    Enhanced version of parse_and_chunk_pdf using smart chunking.
+    Use this instead of parse_and_chunk_pdf for better RAG results.
+    """
+    # Step 1 — extract text (same as before)
+    extraction_result = extract_text_from_pdf(file_path)
+
+    # Step 2 — smart chunk instead of basic chunk
+    chunks = hybrid_chunk(extraction_result["full_text"])
+
+    # Step 3 — get stats for debugging
+    stats = get_chunking_stats(chunks)
+
+    return {
+        "total_pages": extraction_result["total_pages"],
+        "total_characters": extraction_result["total_characters"],
+        "total_chunks": len(chunks),
+        "chunking_stats": stats,
         "pages": extraction_result["pages"],
         "chunks": chunks
     }

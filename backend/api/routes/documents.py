@@ -16,12 +16,33 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from services.pdf_parser import parse_and_chunk_pdf
+from services.pdf_parser import parse_and_chunk_pdf, parse_and_chunk_pdf_smart
 from services.vector_store import (
     embed_and_store_chunks,
     search_similar_chunks,
     get_collection_info
 )
 
+from services.vector_store import (
+    embed_and_store_chunks,
+    search_similar_chunks,
+    get_collection_info,
+    list_embedded_documents        # ← ADD THIS
+)
+from services.rag_service import (
+    ask_question_with_memory,
+    ask_across_documents,          # ← ADD THIS
+    clear_session,
+    get_session_history
+)
+from pydantic import BaseModel
+from typing import List, Optional
+
+class MultiDocQuestionRequest(BaseModel):
+    file_ids: List[str]          # List of doc IDs to search
+    question: str                # The question
+    session_id: Optional[str] = None
+    n_results: int = 5           # Total chunks across all docs
 # ── Router Setup ────────────────────────────────────────────────────────────
 router = APIRouter()
 
@@ -251,3 +272,93 @@ def document_info(file_id: str):
     chunks are stored in ChromaDB.
     """
     return get_collection_info(file_id)
+
+@router.get("/documents/embedded", summary="List all embedded documents")
+def get_embedded_documents():
+    """
+    Returns all documents currently stored in ChromaDB.
+    Use this to see which file_ids you can search across.
+    """
+    return list_embedded_documents()
+
+
+@router.post("/chat/multi", summary="Chat across multiple PDFs")
+def multi_document_chat(request: MultiDocQuestionRequest):
+    """
+    Ask a question that searches across MULTIPLE uploaded PDFs.
+    Returns the most relevant information from all documents combined.
+
+    - **file_ids**: List of document IDs to search across
+    - **question**: Your question
+    - **session_id**: Conversation ID (auto-generated if not provided)
+    """
+    if not request.question.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
+
+    if not request.file_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one file_id is required."
+        )
+
+    session_id = request.session_id or str(uuid.uuid4())[:8]
+
+    result = ask_across_documents(
+        file_ids=request.file_ids,
+        question=request.question,
+        session_id=session_id,
+        n_results=request.n_results
+    )
+
+    if result["status"] == "error":
+        raise HTTPException(
+            status_code=400,
+            detail=result["message"]
+        )
+
+    return result
+
+@router.get("/documents/{file_id}/compare-chunking",
+            summary="Compare basic vs smart chunking")
+def compare_chunking(file_id: str):
+    """
+    Runs both chunking strategies on the same PDF and
+    returns a comparison. Shows why smart chunking is better.
+    """
+    ensure_upload_dir()
+    matched_file = None
+    for filename in os.listdir(UPLOAD_DIR):
+        if filename.startswith(file_id):
+            matched_file = filename
+            break
+
+    if not matched_file:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No document found with file_id '{file_id}'"
+        )
+
+    file_path = os.path.join(UPLOAD_DIR, matched_file)
+
+    # Run both strategies
+    basic_result = parse_and_chunk_pdf(file_path)
+    smart_result = parse_and_chunk_pdf_smart(file_path)
+
+    return {
+        "file_id": file_id,
+        "comparison": {
+            "basic_chunking": {
+                "total_chunks": basic_result["total_chunks"],
+                "sample_chunk": basic_result["chunks"][0]["text"][:200] if basic_result["chunks"] else None,
+            },
+            "smart_chunking": {
+                "total_chunks": smart_result["total_chunks"],
+                "stats": smart_result["chunking_stats"],
+                "sample_chunk": smart_result["chunks"][0]["text"][:200] if smart_result["chunks"] else None,
+                "sample_section_type": smart_result["chunks"][0].get("section_type", "N/A") if smart_result["chunks"] else None,
+            }
+        }
+    }

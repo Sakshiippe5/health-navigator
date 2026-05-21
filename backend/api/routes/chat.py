@@ -1,56 +1,78 @@
 # api/routes/chat.py
 #
-# RESPONSIBILITY: Handle Q&A requests from the user.
-# This is the endpoint your frontend will call when
-# a user types a question about their medical PDF.
+# UPDATED: Session-based chat with memory.
+# Three endpoints:
+#   POST   /chat/{file_id}          → ask a question
+#   GET    /chat/{session_id}/history → view history
+#   DELETE /chat/{session_id}       → clear history
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from services.rag_service import ask_question
+from typing import Optional
+from services.rag_service import (
+    ask_question_with_memory,
+    clear_session,
+    get_session_history
+)
+import uuid
 
 router = APIRouter()
 
 
 # ── Request Schema ────────────────────────────────────────────────────────────
-# Pydantic BaseModel defines the shape of the request body.
-# FastAPI automatically validates incoming JSON against this model.
-# If the request is missing 'question', FastAPI returns 422 automatically.
 class QuestionRequest(BaseModel):
-    question: str           # Required — the user's question
-    n_chunks: int = 3       # Optional — how many chunks to use (default 3)
+    question: str
+    session_id: Optional[str] = None  # auto-generated if not provided
+    n_chunks: int = 3
 
 
-# ── Endpoint ──────────────────────────────────────────────────────────────────
-@router.post("/chat/{file_id}", summary="Ask a question about a PDF")
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/chat/{file_id}", summary="Chat with a PDF (with memory)")
 def chat_with_document(file_id: str, request: QuestionRequest):
     """
-    Ask any question about an uploaded and embedded PDF.
-    The AI will answer based only on the document content.
+    Ask a question about an uploaded PDF.
+    Remembers previous questions in the same session.
 
-    - **file_id**: The document to query
-    - **question**: Your question in plain English
-    - **n_chunks**: Number of context chunks to use (default 3)
+    First message → don't send session_id → one gets created for you
+    Follow-up     → send the session_id from the previous response
     """
 
-    # Validate question isn't empty
     if not request.question.strip():
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty."
         )
 
-    # Run the full RAG pipeline
-    result = ask_question(
+    # Auto-generate session_id if this is a new conversation
+    session_id = request.session_id or str(uuid.uuid4())[:8]
+
+    result = ask_question_with_memory(
         file_id=file_id,
         question=request.question,
+        session_id=session_id,
         n_chunks=request.n_chunks
     )
 
-    # Handle errors from the RAG service
     if result["status"] == "error":
-        raise HTTPException(
-            status_code=400,
-            detail=result["message"]
-        )
+        raise HTTPException(status_code=400, detail=result["message"])
 
     return result
+
+
+@router.get("/chat/{session_id}/history", summary="View conversation history")
+def get_history(session_id: str):
+    """
+    Returns all previous messages in a conversation.
+    Frontend uses this to display the chat timeline.
+    """
+    return get_session_history(session_id)
+
+
+@router.delete("/chat/{session_id}", summary="Clear conversation")
+def clear_conversation(session_id: str):
+    """
+    Deletes all history for a session.
+    Called when user clicks 'New Chat'.
+    """
+    return clear_session(session_id)
