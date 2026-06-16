@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routes import health
 from api.routes import documents 
 from api.routes import chat    
-
+from api.routes import agents
 
 # ---------------------------------------------------------------------------
 # App Initialization
@@ -43,6 +43,7 @@ app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(documents.router, prefix="/api/v1", tags=["Documents"]) 
 app.include_router(chat.router, prefix="/api/v1", tags=["Chat"]) 
+app.include_router(agents.router, prefix="/api/v1", tags=["Agents"])
 
 # ---------------------------------------------------------------------------
 # Root endpoint — sanity check
