@@ -1,17 +1,17 @@
 # main.py — The entry point of your entire backend application
-# This is equivalent to index.js in a Node/Express app
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from database.connection import engine
+from database import models
 from api.routes import health
-from api.routes import documents 
-from api.routes import chat    
+from api.routes import documents
+from api.routes import chat
 from api.routes import agents
-
+from api.routes import auth
 # ---------------------------------------------------------------------------
 # App Initialization
 # ---------------------------------------------------------------------------
-# FastAPI() creates your application instance — think of it like `express()`
 app = FastAPI(
     title="AI Health Navigator",
     description="An AI-powered backend for health document analysis and symptom checking",
@@ -19,36 +19,35 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
+# Create Database Tables
+# ---------------------------------------------------------------------------
+# This runs on startup — creates all tables if they don't exist yet
+# Safe to run multiple times — won't drop existing tables
+models.Base.metadata.create_all(bind=engine)
+
+# ---------------------------------------------------------------------------
 # CORS Middleware
 # ---------------------------------------------------------------------------
-# CORS = Cross-Origin Resource Sharing
-# Your frontend (localhost:3000) and backend (localhost:8000) are on different
-# "origins". Browsers BLOCK these requests by default for security.
-# This middleware tells the browser: "Yes, I trust requests from these origins."
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js dev server
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
-    allow_methods=["*"],   # Allow GET, POST, PUT, DELETE, etc.
-    allow_headers=["*"],   # Allow any headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
 # Route Registration
 # ---------------------------------------------------------------------------
-# Instead of putting all routes in one file (messy), we split them into
-# separate files and "include" them here with a prefix.
-# This is called a "router" pattern — standard in production APIs.
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
-app.include_router(health.router, prefix="/api/v1", tags=["Health"])
-app.include_router(documents.router, prefix="/api/v1", tags=["Documents"]) 
-app.include_router(chat.router, prefix="/api/v1", tags=["Chat"]) 
+app.include_router(documents.router, prefix="/api/v1", tags=["Documents"])
+app.include_router(chat.router, prefix="/api/v1", tags=["Chat"])
 app.include_router(agents.router, prefix="/api/v1", tags=["Agents"])
+app.include_router(auth.router, prefix="/api/v1", tags=["Auth"])
 
 # ---------------------------------------------------------------------------
-# Root endpoint — sanity check
+# Root endpoint
 # ---------------------------------------------------------------------------
 @app.get("/")
 def root():
-    """The very base URL of your API."""
     return {"message": "AI Health Navigator API is running 🚀"}
