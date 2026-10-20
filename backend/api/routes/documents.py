@@ -1,39 +1,14 @@
 # api/routes/documents.py
-#
-# UPDATED: Added Pydantic response_model to every endpoint.
-# All schemas imported from api/schemas.py
-#
-# Endpoints:
-#   POST   /upload                          → upload PDF
-#   GET    /documents                       → list all PDFs
-#   GET    /documents/embedded              → list embedded docs
-#   GET    /documents/{file_id}/parse       → parse PDF into chunks
-#   POST   /documents/{file_id}/embed       → embed into ChromaDB
-#   GET    /documents/{file_id}/info        → check embedding status
-#   GET    /documents/{file_id}/search      → semantic search
-#   GET    /documents/{file_id}/compare-chunking → compare strategies
-#   POST   /chat/multi                      → multi-doc chat
 
 import os
 import uuid
 import aiofiles
 from datetime import datetime, timezone
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
-from typing import Optional
+from fastapi import APIRouter, File, HTTPException, UploadFile, Depends
+from typing import Optional, List
 from pydantic import BaseModel
-from typing import List
+from sqlalchemy.orm import Session
 
-from api.schemas import (
-    UploadResponse,
-    DocumentListResponse,
-    EmbedResponse,
-    CollectionInfo,
-    EmbeddedDocumentsResponse,
-    MultiDocQuestionRequest,
-    MultiDocChatResponse,
-    ParseResponse
-)
 from services.vector_store import (
     embed_and_store_chunks,
     search_similar_chunks,
@@ -49,27 +24,35 @@ from services.rag_service import (
     clear_session,
     get_session_history
 )
+from services.document_service import (
+    create_document,
+    get_user_documents,
+    get_document_by_file_id,
+    mark_document_embedded
+)
+from database.connection import get_db
+from database.models import User
+from core.dependencies import get_current_user
 
-# ── Router Setup ──────────────────────────────────────────────────────────────
 router = APIRouter()
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads")
 MAX_FILE_SIZE_MB = 10
 ALLOWED_TYPES = ["application/pdf"]
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+class MultiDocQuestionRequest(BaseModel):
+    file_ids: List[str]
+    question: str
+    session_id: Optional[str] = None
+    n_results: int = 5
+
+
 def ensure_upload_dir():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def find_file_by_id(file_id: str) -> str:
-    """
-    Finds a file in uploads/ by its ID prefix.
-    Raises 404 if not found.
-    Extracted as helper to avoid repeating this logic in every endpoint.
-    """
     ensure_upload_dir()
     for filename in os.listdir(UPLOAD_DIR):
         if filename.startswith(file_id):
@@ -82,45 +65,41 @@ def find_file_by_id(file_id: str) -> str:
 
 # ── Upload ────────────────────────────────────────────────────────────────────
 
-@router.post(
-    "/upload",
-    response_model=UploadResponse,
-    status_code=201,
-    summary="Upload a medical PDF document"
-)
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Accepts a PDF file upload, validates it, and saves it to disk.
-    - **file**: A PDF file (max 10MB)
-    """
-
-    # Validate file type
+@router.post("/upload", status_code=201, summary="Upload a medical PDF")
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     if file.content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type '{file.content_type}'. Only PDFs allowed."
-        )
+        raise HTTPException(status_code=400, detail="Only PDF files allowed.")
 
-    # Read and check size
     contents = await file.read()
     file_size_mb = len(contents) / (1024 * 1024)
 
     if file_size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large ({file_size_mb:.1f}MB). Max is {MAX_FILE_SIZE_MB}MB."
+            detail=f"File too large. Max {MAX_FILE_SIZE_MB}MB."
         )
 
-    # Generate unique filename
     original_name = file.filename
     unique_prefix = str(uuid.uuid4())[:8]
     safe_filename = f"{unique_prefix}_{original_name}"
     file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
-    # Save to disk
     ensure_upload_dir()
     async with aiofiles.open(file_path, "wb") as buffer:
         await buffer.write(contents)
+
+    create_document(
+        db=db,
+        user_id=current_user.id,
+        file_id=unique_prefix,
+        filename=safe_filename,
+        original_name=original_name,
+        size_mb=round(file_size_mb, 3)
+    )
 
     return {
         "message": "File uploaded successfully",
@@ -134,57 +113,64 @@ async def upload_document(file: UploadFile = File(...)):
 
 # ── List Documents ────────────────────────────────────────────────────────────
 
-@router.get(
-    "/documents",
-    response_model=DocumentListResponse,
-    summary="List all uploaded documents"
-)
-def list_documents():
-    """Returns a list of all uploaded PDF files."""
-    ensure_upload_dir()
-
-    files = []
-    for filename in os.listdir(UPLOAD_DIR):
-        if filename.endswith(".pdf"):
-            file_path = os.path.join(UPLOAD_DIR, filename)
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            files.append({
-                "filename": filename,
-                "size_mb": round(size_mb, 3),
-            })
-
+@router.get("/documents", summary="List current user's documents")
+def list_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_docs = get_user_documents(db, current_user.id)
     return {
-        "total": len(files),
-        "documents": files
+        "total": len(user_docs),
+        "documents": [
+            {
+                "filename": doc.filename,
+                "original_name": doc.original_name,
+                "file_id": doc.file_id,
+                "size_mb": doc.size_mb,
+                "is_embedded": doc.is_embedded,
+                "total_chunks": doc.total_chunks,
+                "uploaded_at": doc.uploaded_at.isoformat() if doc.uploaded_at else None
+            }
+            for doc in user_docs
+        ]
     }
 
 
 # ── List Embedded Documents ───────────────────────────────────────────────────
 
-@router.get(
-    "/documents/embedded",
-    response_model=EmbeddedDocumentsResponse,
-    summary="List all embedded documents"
-)
-def get_embedded_documents():
-    """
-    Returns all documents currently stored in ChromaDB.
-    Use this to see which file_ids you can search across.
-    """
-    return list_embedded_documents()
+@router.get("/documents/embedded", summary="List embedded documents")
+def get_embedded_documents(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_docs = get_user_documents(db, current_user.id)
+    embedded = [doc for doc in user_docs if doc.is_embedded]
+    return {
+        "total_documents": len(embedded),
+        "documents": [
+            {
+                "file_id": doc.file_id,
+                "collection_name": f"doc_{doc.file_id}",
+                "total_chunks": doc.total_chunks,
+                "original_name": doc.original_name
+            }
+            for doc in embedded
+        ]
+    }
 
 
 # ── Parse Document ────────────────────────────────────────────────────────────
 
-@router.get(
-    "/documents/{file_id}/parse",
-    summary="Parse and chunk a PDF"
-)
-def parse_document(file_id: str):
-    """
-    Finds an uploaded PDF by its file_id, extracts all text,
-    and splits it into chunks ready for embedding.
-    """
+@router.get("/documents/{file_id}/parse", summary="Parse and chunk a PDF")
+def parse_document(
+    file_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = get_document_by_file_id(db, file_id, current_user.id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
     matched_file = find_file_by_id(file_id)
     file_path = os.path.join(UPLOAD_DIR, matched_file)
     result = parse_and_chunk_pdf(file_path)
@@ -202,28 +188,30 @@ def parse_document(file_id: str):
 
 # ── Embed Document ────────────────────────────────────────────────────────────
 
-@router.post(
-    "/documents/{file_id}/embed",
-    response_model=EmbedResponse,
-    summary="Embed a PDF into ChromaDB"
-)
-def embed_document(file_id: str):
-    """
-    Parses the PDF, generates embeddings for each chunk,
-    and stores everything in ChromaDB.
+@router.post("/documents/{file_id}/embed", summary="Embed a PDF into ChromaDB")
+def embed_document(
+    file_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = get_document_by_file_id(db, file_id, current_user.id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
 
-    Run AFTER uploading. Run BEFORE asking questions.
-    """
     matched_file = find_file_by_id(file_id)
     file_path = os.path.join(UPLOAD_DIR, matched_file)
 
-    # Parse into chunks
     parse_result = parse_and_chunk_pdf(file_path)
-
-    # Embed and store
     embed_result = embed_and_store_chunks(
         file_id=file_id,
         chunks=parse_result["chunks"]
+    )
+
+    mark_document_embedded(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+        total_chunks=parse_result["total_chunks"]
     )
 
     return {
@@ -239,30 +227,32 @@ def embed_document(file_id: str):
 
 # ── Document Info ─────────────────────────────────────────────────────────────
 
-@router.get(
-    "/documents/{file_id}/info",
-    response_model=CollectionInfo,
-    summary="Check embedding status"
-)
-def document_info(file_id: str):
-    """
-    Check if a document has been embedded and how many
-    chunks are stored in ChromaDB.
-    """
+@router.get("/documents/{file_id}/info", summary="Check embedding status")
+def document_info(
+    file_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = get_document_by_file_id(db, file_id, current_user.id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
     return get_collection_info(file_id)
 
 
 # ── Semantic Search ───────────────────────────────────────────────────────────
 
-@router.get(
-    "/documents/{file_id}/search",
-    summary="Search PDF by meaning"
-)
-def search_document(file_id: str, query: str, n_results: int = 3):
-    """
-    Searches the embedded PDF for chunks relevant to your query.
-    Uses semantic search — finds meaning, not just keywords.
-    """
+@router.get("/documents/{file_id}/search", summary="Search PDF by meaning")
+def search_document(
+    file_id: str,
+    query: str,
+    n_results: int = 3,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = get_document_by_file_id(db, file_id, current_user.id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
     result = search_similar_chunks(
         file_id=file_id,
         query=query,
@@ -272,23 +262,24 @@ def search_document(file_id: str, query: str, n_results: int = 3):
     if result["status"] == "not_embedded":
         raise HTTPException(
             status_code=400,
-            detail="Document not embedded yet. POST to /embed first."
+            detail="Document not embedded yet."
         )
-
     return result
 
 
 # ── Compare Chunking ──────────────────────────────────────────────────────────
 
-@router.get(
-    "/documents/{file_id}/compare-chunking",
-    summary="Compare basic vs smart chunking"
-)
-def compare_chunking(file_id: str):
-    """
-    Runs both chunking strategies on the same PDF and
-    returns a side-by-side comparison.
-    """
+@router.get("/documents/{file_id}/compare-chunking",
+            summary="Compare chunking strategies")
+def compare_chunking(
+    file_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    doc = get_document_by_file_id(db, file_id, current_user.id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
     matched_file = find_file_by_id(file_id)
     file_path = os.path.join(UPLOAD_DIR, matched_file)
 
@@ -308,9 +299,6 @@ def compare_chunking(file_id: str):
                 "stats": smart_result["chunking_stats"],
                 "sample_chunk": smart_result["chunks"][0]["text"][:200]
                     if smart_result["chunks"] else None,
-                "sample_section_type": smart_result["chunks"][0].get(
-                    "section_type", "N/A"
-                ) if smart_result["chunks"] else None,
             }
         }
     }
@@ -318,30 +306,24 @@ def compare_chunking(file_id: str):
 
 # ── Multi-Document Chat ───────────────────────────────────────────────────────
 
-@router.post(
-    "/chat/multi",
-    response_model=MultiDocChatResponse,
-    summary="Chat across multiple PDFs"
-)
-def multi_document_chat(request: MultiDocQuestionRequest):
-    """
-    Ask a question that searches across MULTIPLE uploaded PDFs.
-    Returns the most relevant information from all documents combined.
-    """
+@router.post("/chat/multi", summary="Chat across multiple PDFs")
+def multi_document_chat(
+    request: MultiDocQuestionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     if not request.question.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Question cannot be empty."
-        )
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    if not request.file_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="At least one file_id is required."
-        )
+    for file_id in request.file_ids:
+        doc = get_document_by_file_id(db, file_id, current_user.id)
+        if not doc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Document '{file_id}' not found or access denied."
+            )
 
     session_id = request.session_id or str(uuid.uuid4())[:8]
-
     result = ask_across_documents(
         file_ids=request.file_ids,
         question=request.question,
@@ -350,9 +332,6 @@ def multi_document_chat(request: MultiDocQuestionRequest):
     )
 
     if result["status"] == "error":
-        raise HTTPException(
-            status_code=400,
-            detail=result["message"]
-        )
+        raise HTTPException(status_code=400, detail=result["message"])
 
     return result

@@ -11,6 +11,7 @@ import {
   Activity
 } from 'lucide-react'
 
+
 export default function LandingPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">

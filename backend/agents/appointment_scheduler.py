@@ -22,7 +22,7 @@ from typing import Dict, Any, List
 # ── Initialize LLM ────────────────────────────────────────────────────────────
 llm = ChatGroq(
     api_key=GROQ_API_KEY,
-    model_name="llama-3.3-70b-versatile",
+    model_name="qwen/qwen3.8-27b",
     temperature=0.1
 )
 

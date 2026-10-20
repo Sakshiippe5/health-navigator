@@ -14,15 +14,23 @@ import {
 import { documentAPI } from '@/lib/api'
 import toast, { Toaster } from 'react-hot-toast'
 
-interface Document {
-  filename: string
-  size_mb: number
-}
+
 
 interface EmbeddedDoc {
   file_id: string
   collection_name: string
   total_chunks: number
+}
+
+// Update the interface at top of documents/page.tsx
+interface Document {
+  filename: string
+  original_name: string
+  file_id: string
+  size_mb: number
+  is_embedded: boolean
+  total_chunks: number
+  uploaded_at: string
 }
 
 export default function DocumentsPage() {
@@ -38,13 +46,14 @@ export default function DocumentsPage() {
   }, [])
 
   const loadDocuments = async () => {
-    try {
-      const data = await documentAPI.list()
-      setDocuments(data.documents)
-    } catch (error) {
-      console.error('Failed to load documents')
-    }
+  try {
+    const data = await documentAPI.list()
+    setDocuments(data.documents)
+    // No need for separate embedded check — is_embedded comes from DB
+  } catch (error) {
+    console.error('Failed to load documents')
   }
+}
 
   const loadEmbedded = async () => {
     try {
@@ -90,17 +99,18 @@ export default function DocumentsPage() {
     }
   }
 
-  const getFileId = (filename: string) => filename.split('_')[0]
+  // const getFileId = (filename: string) => filename.split('_')[0]
 
-  const isEmbedded = (filename: string) => {
-    const fileId = getFileId(filename)
-    return embeddedDocs.some(doc => doc.file_id === fileId)
-  }
+  // const isEmbedded = (filename: string) => {
+  //   const fileId = getFileId(filename)
+  //   return embeddedDocs.some(doc => doc.file_id === fileId)
+  // }
 
-  const getChunkCount = (filename: string) => {
-    const fileId = getFileId(filename)
-    return embeddedDocs.find(doc => doc.file_id === fileId)?.total_chunks || 0
-  }
+
+  // const getChunkCount = (filename: string) => {
+  //   const fileId = getFileId(filename)
+  //   return embeddedDocs.find(doc => doc.file_id === fileId)?.total_chunks || 0
+  // }
 
   return (
     <div>
@@ -153,10 +163,11 @@ export default function DocumentsPage() {
       ) : (
         <div className="space-y-3">
           {documents.map((doc, i) => {
-            const fileId = getFileId(doc.filename)
-            const embedded = isEmbedded(doc.filename)
-            const chunks = getChunkCount(doc.filename)
-            const isEmbedding = embedding === fileId
+  
+              const fileId = doc.file_id
+              const embedded = doc.is_embedded
+              const chunks = doc.total_chunks
+              const isEmbedding = embedding === fileId
 
             return (
               <div

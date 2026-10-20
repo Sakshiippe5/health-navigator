@@ -1,115 +1,94 @@
 # api/routes/agents.py
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List
+from sqlalchemy.orm import Session
 from agents.symptom_checker import check_symptoms
 from agents.drug_interaction import check_drug_interactions
 from agents.appointment_scheduler import schedule_appointment
 from services.health_pipeline import run_health_pipeline
+from services.document_service import save_agent_result, get_user_agent_results
+from database.connection import get_db
+from database.models import User
+from core.dependencies import get_current_user
 
 router = APIRouter()
 
 
-# ── Symptom Checker Schema ────────────────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────────────
+
 class SymptomRequest(BaseModel):
-    symptoms: str = Field(
-        ...,
-        min_length=5,
-        description="Describe your symptoms in detail"
-    )
-    patient_age: Optional[int] = Field(default=None, ge=0, le=120)
-    medical_history: Optional[str] = Field(
-        default=None,
-        description="Any relevant medical history"
-    )
-
-
-# ── Drug Interaction Schema ───────────────────────────────────────────────────
-class DrugInteractionRequest(BaseModel):
-    medications: List[str] = Field(
-        ...,
-        min_length=2,
-        description="List of at least 2 medication names"
-    )
-    patient_age: Optional[int] = Field(default=None, ge=0, le=120)
-    conditions: Optional[str] = Field(
-        default=None,
-        description="Existing medical conditions"
-    )
-
-
-# ── Appointment Schema ────────────────────────────────────────────────────────
-class AppointmentRequest(BaseModel):
     symptoms: str = Field(..., min_length=5)
-    urgency_level: str = Field(
-        ...,
-        description="EMERGENCY, HIGH, MEDIUM, or LOW"
-    )
-    specialist_needed: str = Field(
-        ...,
-        description="Type of specialist needed"
-    )
-    possible_conditions: Optional[List[str]] = None
-    patient_age: Optional[int] = Field(default=None, ge=0, le=120)
-
-
-# ── Health Pipeline Schema ────────────────────────────────────────────────────
-class HealthPipelineRequest(BaseModel):
-    symptoms: str = Field(
-        ...,
-        min_length=5,
-        description="Describe your symptoms in detail"
-    )
-    medications: Optional[List[str]] = Field(
-        default=None,
-        description="Current medications (optional, need 2+ for interaction check)"
-    )
     patient_age: Optional[int] = Field(default=None, ge=0, le=120)
     medical_history: Optional[str] = None
 
 
-# ── Symptom Checker Endpoint ──────────────────────────────────────────────────
-@router.post(
-    "/agents/symptom-check",
-    summary="AI Symptom Checker Agent"
-)
-def symptom_check(request: SymptomRequest):
-    """
-    Runs the LangGraph symptom checker agent.
-    Analyzes symptoms and returns structured triage assessment.
+class DrugInteractionRequest(BaseModel):
+    medications: List[str] = Field(..., min_length=2)
+    patient_age: Optional[int] = Field(default=None, ge=0, le=120)
+    conditions: Optional[str] = None
 
-    ⚠️ Not a replacement for professional medical advice.
-    """
+
+class AppointmentRequest(BaseModel):
+    symptoms: str = Field(..., min_length=5)
+    urgency_level: str = Field(..., description="EMERGENCY, HIGH, MEDIUM, or LOW")
+    specialist_needed: str = Field(..., description="Type of specialist needed")
+    possible_conditions: Optional[List[str]] = None
+    patient_age: Optional[int] = Field(default=None, ge=0, le=120)
+
+
+class HealthPipelineRequest(BaseModel):
+    symptoms: str = Field(..., min_length=5)
+    medications: Optional[List[str]] = None
+    patient_age: Optional[int] = Field(default=None, ge=0, le=120)
+    medical_history: Optional[str] = None
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/agents/symptom-check", summary="AI Symptom Checker Agent")
+def symptom_check(
+    request: SymptomRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Runs the LangGraph symptom checker agent."""
     try:
         result = check_symptoms(
             symptoms=request.symptoms,
             patient_age=request.patient_age,
             medical_history=request.medical_history
         )
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent error: {str(e)}"
+
+        save_agent_result(
+            db=db,
+            user_id=current_user.id,
+            agent_type="symptom",
+            input_data={
+                "symptoms": request.symptoms,
+                "patient_age": request.patient_age,
+                "medical_history": request.medical_history
+            },
+            result_data=result,
+            urgency_level=result.get("urgency_level")
         )
 
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
-# ── Drug Interaction Endpoint ─────────────────────────────────────────────────
-@router.post(
-    "/agents/drug-interactions",
-    summary="Drug Interaction Detector Agent"
-)
-def drug_interaction_check(request: DrugInteractionRequest):
-    """
-    Checks all combinations of provided medications for
-    dangerous interactions using a LangGraph agent.
 
-    ⚠️ Not a replacement for professional medical advice.
-    """
+@router.post("/agents/drug-interactions", summary="Drug Interaction Detector")
+def drug_interaction_check(
+    request: DrugInteractionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Checks all medication combinations for dangerous interactions."""
     if len(request.medications) < 2:
         raise HTTPException(
             status_code=400,
-            detail="Please provide at least 2 medications to check."
+            detail="Please provide at least 2 medications."
         )
 
     try:
@@ -118,30 +97,32 @@ def drug_interaction_check(request: DrugInteractionRequest):
             patient_age=request.patient_age,
             conditions=request.conditions
         )
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent error: {str(e)}"
+
+        save_agent_result(
+            db=db,
+            user_id=current_user.id,
+            agent_type="drug",
+            input_data={
+                "medications": request.medications,
+                "patient_age": request.patient_age,
+                "conditions": request.conditions
+            },
+            result_data=result,
+            urgency_level=result.get("overall_risk")
         )
 
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
-# ── Appointment Scheduler Endpoint ────────────────────────────────────────────
-@router.post(
-    "/agents/schedule-appointment",
-    summary="Appointment Scheduler Agent"
-)
-def appointment_schedule(request: AppointmentRequest):
-    """
-    Creates a complete appointment plan including:
-    - Timeframe and appointment type
-    - Scheduling steps
-    - Preparation checklist
-    - Questions to ask the doctor
-    - Red flag warnings
 
-    ⚠️ Not a replacement for professional medical advice.
-    """
+@router.post("/agents/schedule-appointment", summary="Appointment Scheduler Agent")
+def appointment_schedule(
+    request: AppointmentRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Creates a complete appointment plan."""
     valid_urgency = ["EMERGENCY", "HIGH", "MEDIUM", "LOW"]
     if request.urgency_level.upper() not in valid_urgency:
         raise HTTPException(
@@ -159,27 +140,16 @@ def appointment_schedule(request: AppointmentRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
 
-# ── Health Pipeline Endpoint ──────────────────────────────────────────────────
-@router.post(
-    "/agents/health-assessment",
-    summary="Complete Health Assessment Pipeline"
-)
-def complete_health_assessment(request: HealthPipelineRequest):
-    """
-    Runs ALL 3 agents in sequence and returns a unified report:
-
-    1. 🔍 Symptom Checker — triage assessment
-    2. 💊 Drug Interaction Detector — medication safety
-    3. 📅 Appointment Scheduler — booking plan
-
-    ⚠️ Not a replacement for professional medical advice.
-    """
+@router.post("/agents/health-assessment", summary="Complete Health Assessment Pipeline")
+def complete_health_assessment(
+    request: HealthPipelineRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Runs ALL 3 agents and returns a unified report."""
     try:
         result = run_health_pipeline(
             symptoms=request.symptoms,
@@ -187,9 +157,51 @@ def complete_health_assessment(request: HealthPipelineRequest):
             patient_age=request.patient_age,
             medical_history=request.medical_history
         )
+
+        save_agent_result(
+            db=db,
+            user_id=current_user.id,
+            agent_type="pipeline",
+            input_data={
+                "symptoms": request.symptoms,
+                "medications": request.medications,
+                "patient_age": request.patient_age,
+                "medical_history": request.medical_history
+            },
+            result_data=result,
+            urgency_level=result.get("overall_urgency")
+        )
+
         return result
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Pipeline error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
+
+
+@router.get("/agents/history", summary="Get past agent assessments")
+def get_agent_history(
+    agent_type: str = None,
+    limit: int = 10,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Returns the current user's past agent assessments."""
+    results = get_user_agent_results(
+        db=db,
+        user_id=current_user.id,
+        agent_type=agent_type,
+        limit=limit
+    )
+
+    return {
+        "total": len(results),
+        "history": [
+            {
+                "id": r.id,
+                "agent_type": r.agent_type,
+                "urgency_level": r.urgency_level,
+                "input_data": r.input_data,
+                "created_at": r.created_at.isoformat() if r.created_at else None
+            }
+            for r in results
+        ]
+    }

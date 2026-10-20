@@ -8,7 +8,7 @@ from typing import Dict, Any, List
 
 # ── Initialize Groq ───────────────────────────────────────────────────────────
 client = Groq(api_key=GROQ_API_KEY)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "qwen/qwen3.8-27b"
 
 # ── System Prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a helpful medical document assistant.
